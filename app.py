@@ -236,30 +236,57 @@ def fetch_tax_rates():
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_yields():
     try:
-        tables = pd.read_html(io.StringIO(_get(TE_URL).text))
+        html = _get(TE_URL).text
         yields, dates = {}, []
+
+        def clean_name(cell) -> str | None:
+            s = re.sub(r"\s+", " ", str(cell)).strip()
+            s = re.sub(r"\s*\d+\s*Y$", "", s, flags=re.I).strip()  # "US 10Y" -> "US"
+            s = TE_ALIASES.get(s, s)
+            return s if s in COUNTRIES else None
+
+        try:
+            tables = pd.read_html(io.StringIO(html))
+        except Exception:  # noqa: BLE001  (no <table> or parser missing)
+            tables = []
         for t in tables:
-            cols = [str(c) for c in t.columns]
-            if "Yield" not in cols:
-                continue
-            t.columns = cols
+            t.columns = [" ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in t.columns]
+            ycol = next((c for c in t.columns if c.strip().lower() == "yield"), None)
+            dcol = next((c for c in t.columns if c.strip().lower() == "date"), None)
             for _, row in t.iterrows():
-                name = str(row[cols[0]]).strip()
-                name = TE_ALIASES.get(name, name)
-                try:
-                    y = float(str(row["Yield"]).replace("%", ""))
-                except ValueError:
+                # country can sit in any text column (first column is sometimes a flag)
+                name = next((n for n in (clean_name(v) for v in row.tolist()) if n), None)
+                if not name:
                     continue
-                yields.setdefault(name, y)  # first table = 10Y majors
-                if "Date" in cols:
-                    dates.append(str(row["Date"]))
+                cand = [row[ycol]] if ycol else [v for v in row.tolist() if v is not None]
+                y = None
+                for v in cand:
+                    try:
+                        y = float(str(v).replace("%", "").strip())
+                        break
+                    except ValueError:
+                        continue
+                if y is None:
+                    continue
+                yields.setdefault(name, y)  # first table on the page = 10Y benchmarks
+                if dcol:
+                    dates.append(str(row[dcol]))
         if "United States" not in yields:
-            raise ValueError("US yield missing")
+            # Last resort: regex over raw HTML rows, e.g. >United States<  ...  >4.123<
+            for name in COUNTRIES:
+                aliases = [name] + [k for k, v in TE_ALIASES.items() if v == name]
+                for a in aliases:
+                    m = re.search(rf">\s*{re.escape(a)}(?:\s*10Y)?\s*<.*?>\s*(-?\d+\.\d+)\s*<", html, flags=re.S | re.I)
+                    if m:
+                        yields.setdefault(name, float(m.group(1)))
+                        break
+        if "United States" not in yields:
+            raise ValueError(f"US yield not found ({len(tables)} tables, {len(html)} chars; possible bot block)")
         out = {n: yields.get(n, FALLBACK_YIELDS.get(n)) for n in COUNTRIES}
         as_of = f"{date.today()} (quote time {dates[0]})" if dates else str(date.today())
         return out, "Trading Economics, 10-year government bond yields", as_of, True
     except Exception as e:  # noqa: BLE001
-        return FALLBACK_YIELDS, f"Fallback values (Trading Economics fetch failed: {type(e).__name__})", "stored", False
+        return FALLBACK_YIELDS, f"Fallback values (Trading Economics fetch failed: {type(e).__name__}: {str(e)[:80]})", "stored", False
 
 
 # ----------------------------------------------------------------------------
